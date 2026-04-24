@@ -86,9 +86,6 @@ func newStatusCmd() *cobra.Command {
 				return fmt.Errorf("no filters configured")
 			}
 
-			ctx, cancel := context.WithTimeout(cmd.Context(), 60*time.Second)
-			defer cancel()
-
 			client := gh.New()
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "REPO\t#\tAUTHOR\tAUTO-MERGE\tSTATE\tMERGEABLE\tTITLE")
@@ -103,8 +100,12 @@ func newStatusCmd() *cobra.Command {
 			}
 			sort.Strings(keys)
 
+			// Per-repo timeout so a slow repo can't starve later ones.
+			const perRepoTimeout = 30 * time.Second
 			for _, repo := range keys {
-				prs, err := client.ListOpenPRs(ctx, repo)
+				repoCtx, cancel := context.WithTimeout(cmd.Context(), perRepoTimeout)
+				prs, err := client.ListOpenPRs(repoCtx, repo)
+				cancel()
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "[%s] list error: %v\n", repo, err)
 					continue
@@ -292,9 +293,18 @@ func matchesAny(pr gh.PullRequest, filters []config.Filter) bool {
 	return false
 }
 
+// truncate shortens s to at most n runes, appending an ellipsis on truncation.
+// Rune-aware so multi-byte characters aren't cut mid-sequence.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	if n <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	if n == 1 {
+		return "…"
+	}
+	return string(runes[:n-1]) + "…"
 }

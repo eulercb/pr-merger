@@ -47,14 +47,20 @@ var prListFields = strings.Join([]string{
 // prViewFields include per-PR details plus the status-check rollup.
 var prViewFields = prListFields + ",id,statusCheckRollup"
 
-// ListOpenPRs returns all open PRs in repo (owner/name). Auto-merge state
-// is available on the result; callers filter by it.
+// listLimit caps how many open PRs we fetch per repo per tick. 500 covers
+// realistic repo sizes while keeping latency bounded. Repos with more than
+// this many open PRs risk missing eligible auto-merge PRs; if that becomes
+// an issue, switch to paginated GraphQL search queries.
+const listLimit = "500"
+
+// ListOpenPRs returns up to listLimit open PRs in repo (owner/name).
+// Auto-merge state is available on the result; callers filter by it.
 func (c *Client) ListOpenPRs(ctx context.Context, repo string) ([]PullRequest, error) {
 	out, err := c.run(ctx,
 		"pr", "list",
 		"--repo", repo,
 		"--state", "open",
-		"--limit", "200",
+		"--limit", listLimit,
 		"--json", prListFields,
 	)
 	if err != nil {
@@ -103,14 +109,18 @@ func (c *Client) UpdateBranchRebase(ctx context.Context, prNodeID string) error 
 }
 
 // EnableAutoMerge turns on auto-merge for a PR with the given merge method.
-// Method is one of: merge, squash, rebase.
+// Method must be one of: merge, squash, rebase.
 func (c *Client) EnableAutoMerge(ctx context.Context, repo string, number int, method string) error {
-	flag := "--merge"
+	var flag string
 	switch strings.ToLower(method) {
+	case "merge":
+		flag = "--merge"
 	case "squash":
 		flag = "--squash"
 	case "rebase":
 		flag = "--rebase"
+	default:
+		return fmt.Errorf("invalid auto-merge method %q: must be one of merge, squash, rebase", method)
 	}
 	_, err := c.run(ctx,
 		"pr", "merge", fmt.Sprint(number),

@@ -20,9 +20,6 @@ type Watcher struct {
 	Filters  []config.Filter
 	Interval time.Duration
 	Logger   *log.Logger
-
-	mu     sync.Mutex
-	active map[string]int // repo -> PR number currently being processed
 }
 
 func New(client *gh.Client, filters []config.Filter, interval time.Duration, logger *log.Logger) *Watcher {
@@ -34,7 +31,6 @@ func New(client *gh.Client, filters []config.Filter, interval time.Duration, log
 		Filters:  filters,
 		Interval: interval,
 		Logger:   logger,
-		active:   map[string]int{},
 	}
 }
 
@@ -42,6 +38,9 @@ func New(client *gh.Client, filters []config.Filter, interval time.Duration, log
 func (w *Watcher) Run(ctx context.Context) error {
 	if len(w.Filters) == 0 {
 		return fmt.Errorf("no filters configured")
+	}
+	if w.Interval <= 0 {
+		return fmt.Errorf("poll interval must be positive, got %s", w.Interval)
 	}
 	w.Logger.Printf("watcher started: %d filter(s), poll every %s", len(w.Filters), w.Interval)
 
@@ -99,7 +98,6 @@ func (w *Watcher) processRepo(ctx context.Context, repo string, filters []config
 
 	queue := filterQueue(prs, filters)
 	if len(queue) == 0 {
-		w.clearActive(repo)
 		w.Logger.Printf("[%s] no auto-merge PRs match filters", repo)
 		return nil
 	}
@@ -110,7 +108,6 @@ func (w *Watcher) processRepo(ctx context.Context, repo string, filters []config
 	})
 
 	head := queue[0]
-	w.setActive(repo, head.Number)
 
 	// Refetch with status-check rollup for accurate state.
 	full, err := w.Client.GetPR(ctx, repo, head.Number)
@@ -225,32 +222,19 @@ func summarizeChecks(logger *log.Logger, repo string, pr *gh.PullRequest) {
 	logger.Print(msg)
 }
 
-func (w *Watcher) setActive(repo string, number int) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.active[repo] = number
-}
-
-func (w *Watcher) clearActive(repo string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	delete(w.active, repo)
-}
-
-// Active returns a snapshot of the current per-repo active PR numbers.
-func (w *Watcher) Active() map[string]int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	out := make(map[string]int, len(w.active))
-	for k, v := range w.active {
-		out[k] = v
-	}
-	return out
-}
-
+// truncate shortens s to at most n runes, appending a single-rune ellipsis
+// when truncation happens. Rune-aware so multi-byte characters (common in
+// PR titles) aren't cut mid-sequence.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	if n <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	if n == 1 {
+		return "…"
+	}
+	return string(runes[:n-1]) + "…"
 }
