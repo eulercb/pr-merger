@@ -26,25 +26,33 @@ file:
 PR_MERGER_CONFIG=/tmp/pr-merger-test.yaml ./pr-merger filter list
 ```
 
-There is no CI workflow yet. If you add one, wire it to run `go vet` and
-`go test ./...` at a minimum.
+CI runs `go vet`, `go build`, and `go test -race` on every push and PR. See
+`.github/workflows/ci.yml`.
 
 ## Code layout
 
 ```
-cmd/pr-merger/        CLI entry point (cobra). Commands: watch, status,
-                      filter add|list|remove, config path.
+cmd/pr-merger/        CLI entry point (cobra). Default command launches the
+                      TUI; subcommands: watch, status, filter add|list|remove,
+                      config path, setup (wizard).
 internal/config/      YAML-backed filter persistence. Config struct and
                       Filter type live here.
-internal/gh/          Wrapper over the gh CLI. Client methods shell out to
-                      `gh pr list|view|merge` and `gh api graphql`. PR and
-                      StatusCheck types live in types.go.
+internal/gh/          Wrapper over the gh CLI + PRClient interface for
+                      testability. Shells out to `gh pr list|view|merge` and
+                      `gh api graphql`. PR and StatusCheck types in types.go;
+                      PRState / icons in status.go; CurrentUser +
+                      RecentContributedRepos in discover.go.
 internal/prutil/      Shared helpers: MatchesAny/Matches (filter matching)
-                      and Truncate (rune-aware). Used by both watcher and
+                      and Truncate (rune-aware). Used by watcher, TUI, and
                       the status command to avoid drift.
-internal/watcher/     Poll loop. Groups filters by repo, fans out one
-                      goroutine per repo (each bounded by Interval), and
-                      picks at most one PR per repo per tick.
+internal/tui/         Bubble Tea dashboard: per-repo panels with status
+                      icons. Subscribes to watcher.Events.
+internal/watcher/     One long-running goroutine per repo, each with its own
+                      ticker and per-tick timeout. Publishes every
+                      observation/action as a watcher.Event so subscribers
+                      (TUI, log writer, tests) can react live.
+internal/wizard/      First-run configuration wizard. Pure helpers in
+                      wizard.go; Bubble Tea UI in tui.go.
 ```
 
 ## Conventions and guardrails
