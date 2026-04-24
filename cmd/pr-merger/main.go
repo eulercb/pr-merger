@@ -250,4 +250,3 @@ func newConfigCmd() *cobra.Command {
 	})
 	return cmd
 }
-
