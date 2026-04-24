@@ -1,0 +1,4 @@
+/pr-merger
+/bin/
+*.test
+*.out
