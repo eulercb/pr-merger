@@ -16,6 +16,7 @@ import (
 
 	"github.com/eulercb/pr-merger/internal/config"
 	"github.com/eulercb/pr-merger/internal/gh"
+	"github.com/eulercb/pr-merger/internal/prutil"
 	"github.com/eulercb/pr-merger/internal/watcher"
 )
 
@@ -112,7 +113,7 @@ func newStatusCmd() *cobra.Command {
 				}
 				sort.Slice(prs, func(i, j int) bool { return prs[i].Number < prs[j].Number })
 				for _, pr := range prs {
-					if !matchesAny(pr, repos[repo]) {
+					if !prutil.MatchesAny(pr, repos[repo]) {
 						continue
 					}
 					auto := "no"
@@ -121,7 +122,7 @@ func newStatusCmd() *cobra.Command {
 					}
 					fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
 						repo, pr.Number, pr.Author.Login, auto,
-						pr.MergeStateStatus, pr.Mergeable, truncate(pr.Title, 60))
+						pr.MergeStateStatus, pr.Mergeable, prutil.Truncate(pr.Title, 60))
 				}
 			}
 			return w.Flush()
@@ -250,61 +251,3 @@ func newConfigCmd() *cobra.Command {
 	return cmd
 }
 
-// ---- shared helpers ----
-
-func matchesAny(pr gh.PullRequest, filters []config.Filter) bool {
-	for _, f := range filters {
-		if f.Base != "" && pr.BaseRefName != f.Base {
-			continue
-		}
-		if len(f.Authors) > 0 {
-			match := false
-			for _, a := range f.Authors {
-				if strings.EqualFold(a, pr.Author.Login) {
-					match = true
-					break
-				}
-			}
-			if !match {
-				continue
-			}
-		}
-		if len(f.Labels) > 0 {
-			haveAll := true
-			for _, want := range f.Labels {
-				found := false
-				for _, l := range pr.Labels {
-					if strings.EqualFold(l.Name, want) {
-						found = true
-						break
-					}
-				}
-				if !found {
-					haveAll = false
-					break
-				}
-			}
-			if !haveAll {
-				continue
-			}
-		}
-		return true
-	}
-	return false
-}
-
-// truncate shortens s to at most n runes, appending an ellipsis on truncation.
-// Rune-aware so multi-byte characters aren't cut mid-sequence.
-func truncate(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	if n == 1 {
-		return "…"
-	}
-	return string(runes[:n-1]) + "…"
-}

@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"log"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/eulercb/pr-merger/internal/config"
 	"github.com/eulercb/pr-merger/internal/gh"
+	"github.com/eulercb/pr-merger/internal/prutil"
 )
 
 // Watcher monitors PRs across the configured filters and, one at a time per
@@ -62,7 +62,9 @@ func (w *Watcher) Run(ctx context.Context) error {
 }
 
 // iterate fans out across repos (one goroutine per repo) so slow repos don't
-// block others. Inside a repo the processing is strictly serial.
+// block others. Inside a repo the processing is strictly serial, and each
+// per-repo call is bounded by Interval so a hung gh invocation can't stall
+// the whole watcher.
 func (w *Watcher) iterate(ctx context.Context) {
 	byRepo := groupFiltersByRepo(w.Filters)
 
@@ -71,7 +73,9 @@ func (w *Watcher) iterate(ctx context.Context) {
 		wg.Add(1)
 		go func(repo string, filters []config.Filter) {
 			defer wg.Done()
-			if err := w.processRepo(ctx, repo, filters); err != nil {
+			repoCtx, cancel := context.WithTimeout(ctx, w.Interval)
+			defer cancel()
+			if err := w.processRepo(repoCtx, repo, filters); err != nil {
 				w.Logger.Printf("[%s] iteration error: %v", repo, err)
 			}
 		}(repo, filters)
@@ -115,8 +119,23 @@ func (w *Watcher) processRepo(ctx context.Context, repo string, filters []config
 		return fmt.Errorf("view PR #%d: %w", head.Number, err)
 	}
 
+	// Re-validate eligibility: the user may have disabled auto-merge,
+	// marked the PR as draft, or changed labels between list and view.
+	if full.AutoMergeRequest == nil {
+		w.Logger.Printf("[%s] PR #%d no longer has auto-merge enabled; skipping", repo, full.Number)
+		return nil
+	}
+	if full.IsDraft {
+		w.Logger.Printf("[%s] PR #%d is now a draft; skipping", repo, full.Number)
+		return nil
+	}
+	if !prutil.MatchesAny(*full, filters) {
+		w.Logger.Printf("[%s] PR #%d no longer matches any filter; skipping", repo, full.Number)
+		return nil
+	}
+
 	w.Logger.Printf("[%s] head PR #%d %q (state=%s, mergeable=%s)",
-		repo, full.Number, truncate(full.Title, 60), full.MergeStateStatus, full.Mergeable)
+		repo, full.Number, prutil.Truncate(full.Title, 60), full.MergeStateStatus, full.Mergeable)
 
 	switch full.MergeStateStatus {
 	case "BEHIND":
@@ -136,6 +155,11 @@ func (w *Watcher) processRepo(ctx context.Context, repo string, filters []config
 		w.Logger.Printf("[%s] PR #%d clean, waiting for GitHub auto-merge", repo, full.Number)
 	case "DIRTY":
 		w.Logger.Printf("[%s] PR #%d has merge conflicts; human action required", repo, full.Number)
+	default:
+		// Unknown/new state from GitHub. Log so the operator can tell what
+		// happened instead of silently no-oping.
+		w.Logger.Printf("[%s] PR #%d has unhandled merge state status %q (mergeable=%s); treating as unknown",
+			repo, full.Number, full.MergeStateStatus, full.Mergeable)
 	}
 	return nil
 }
@@ -151,51 +175,12 @@ func filterQueue(prs []gh.PullRequest, filters []config.Filter) []gh.PullRequest
 		if pr.AutoMergeRequest == nil {
 			continue
 		}
-		if !matchesAny(pr, filters) {
+		if !prutil.MatchesAny(pr, filters) {
 			continue
 		}
 		out = append(out, pr)
 	}
 	return out
-}
-
-func matchesAny(pr gh.PullRequest, filters []config.Filter) bool {
-	for _, f := range filters {
-		if matches(pr, f) {
-			return true
-		}
-	}
-	return false
-}
-
-func matches(pr gh.PullRequest, f config.Filter) bool {
-	if f.Base != "" && pr.BaseRefName != f.Base {
-		return false
-	}
-	if len(f.Authors) > 0 && !containsFold(f.Authors, pr.Author.Login) {
-		return false
-	}
-	if len(f.Labels) > 0 {
-		labels := make([]string, 0, len(pr.Labels))
-		for _, l := range pr.Labels {
-			labels = append(labels, l.Name)
-		}
-		for _, want := range f.Labels {
-			if !containsFold(labels, want) {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func containsFold(haystack []string, needle string) bool {
-	for _, h := range haystack {
-		if strings.EqualFold(h, needle) {
-			return true
-		}
-	}
-	return false
 }
 
 func summarizeChecks(logger *log.Logger, repo string, pr *gh.PullRequest) {
@@ -220,21 +205,4 @@ func summarizeChecks(logger *log.Logger, repo string, pr *gh.PullRequest) {
 		msg += " (first failure: " + firstFailure + ")"
 	}
 	logger.Print(msg)
-}
-
-// truncate shortens s to at most n runes, appending a single-rune ellipsis
-// when truncation happens. Rune-aware so multi-byte characters (common in
-// PR titles) aren't cut mid-sequence.
-func truncate(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	if n == 1 {
-		return "…"
-	}
-	return string(runes[:n-1]) + "…"
 }

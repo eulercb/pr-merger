@@ -63,30 +63,20 @@ func (s StatusCheck) Display() string {
 // Passed reports whether the check completed successfully or was skipped.
 func (s StatusCheck) Passed() bool {
 	if s.TypeName == "CheckRun" {
-		if s.Status != "COMPLETED" {
-			return false
-		}
-		switch s.Conclusion {
-		case "SUCCESS", "NEUTRAL", "SKIPPED":
-			return true
-		}
-		return false
+		return s.Status == "COMPLETED" && isSuccessConclusion(s.Conclusion)
 	}
 	// CommitStatus
 	return s.State == "SUCCESS"
 }
 
-// Failed reports whether the check finished in a failed state.
+// Failed reports whether the check finished in a non-success state. Any
+// completed CheckRun conclusion that isn't an explicit success
+// (SUCCESS/NEUTRAL/SKIPPED) counts as failed — including less common
+// conclusions like ACTION_REQUIRED and STALE — so summaries don't silently
+// drop blocking checks when GitHub introduces new conclusions.
 func (s StatusCheck) Failed() bool {
 	if s.TypeName == "CheckRun" {
-		if s.Status != "COMPLETED" {
-			return false
-		}
-		switch s.Conclusion {
-		case "FAILURE", "CANCELLED", "TIMED_OUT", "STARTUP_FAILURE":
-			return true
-		}
-		return false
+		return s.Status == "COMPLETED" && !isSuccessConclusion(s.Conclusion)
 	}
 	switch s.State {
 	case "FAILURE", "ERROR":
@@ -101,4 +91,12 @@ func (s StatusCheck) Pending() bool {
 		return s.Status != "COMPLETED"
 	}
 	return s.State == "PENDING"
+}
+
+func isSuccessConclusion(c string) bool {
+	switch c {
+	case "SUCCESS", "NEUTRAL", "SKIPPED":
+		return true
+	}
+	return false
 }
