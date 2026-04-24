@@ -171,7 +171,7 @@ func TestProcessRepo_RebasesBehindHead(t *testing.T) {
 	}
 	w := newTestWatcher(t, fc, []config.Filter{{Name: "f", Repo: "org/r"}})
 
-	err := w.processRepo(context.Background(), "org/r", w.Filters)
+	err := w.processRepo(context.Background(), context.Background(), "org/r", w.Filters)
 	require.NoError(t, err)
 
 	// It must have rebased the oldest PR (FIFO).
@@ -195,7 +195,7 @@ func TestProcessRepo_SkipsRebaseOnConflict(t *testing.T) {
 	}
 	w := newTestWatcher(t, fc, []config.Filter{{Name: "f", Repo: "org/r"}})
 
-	require.NoError(t, w.processRepo(context.Background(), "org/r", w.Filters))
+	require.NoError(t, w.processRepo(context.Background(), context.Background(), "org/r", w.Filters))
 	assert.Empty(t, fc.rebaseCalls, "must not rebase when CONFLICTING")
 
 	events := drainEvents(w.Events)
@@ -214,7 +214,7 @@ func TestProcessRepo_SkipsWhenAutoMergeDisabledBetweenListAndView(t *testing.T) 
 	}
 	w := newTestWatcher(t, fc, []config.Filter{{Name: "f", Repo: "org/r"}})
 
-	require.NoError(t, w.processRepo(context.Background(), "org/r", w.Filters))
+	require.NoError(t, w.processRepo(context.Background(), context.Background(), "org/r", w.Filters))
 	assert.Empty(t, fc.rebaseCalls, "must not rebase when auto-merge was disabled")
 }
 
@@ -228,7 +228,7 @@ func TestProcessRepo_CleanEmitsWaiting(t *testing.T) {
 	}
 	w := newTestWatcher(t, fc, []config.Filter{{Name: "f", Repo: "org/r"}})
 
-	require.NoError(t, w.processRepo(context.Background(), "org/r", w.Filters))
+	require.NoError(t, w.processRepo(context.Background(), context.Background(), "org/r", w.Filters))
 	assert.Empty(t, fc.rebaseCalls)
 
 	events := drainEvents(w.Events)
@@ -245,7 +245,7 @@ func TestProcessRepo_UnknownStateLogsAndEmits(t *testing.T) {
 	}
 	w := newTestWatcher(t, fc, []config.Filter{{Name: "f", Repo: "org/r"}})
 
-	require.NoError(t, w.processRepo(context.Background(), "org/r", w.Filters))
+	require.NoError(t, w.processRepo(context.Background(), context.Background(), "org/r", w.Filters))
 	events := drainEvents(w.Events)
 	assert.Contains(t, kinds(events), EventWaiting)
 }
@@ -257,7 +257,7 @@ func TestProcessRepo_NoEligiblePRsEmitsEmptySnapshot(t *testing.T) {
 	}
 	w := newTestWatcher(t, fc, []config.Filter{{Name: "f", Repo: "org/r"}})
 
-	require.NoError(t, w.processRepo(context.Background(), "org/r", w.Filters))
+	require.NoError(t, w.processRepo(context.Background(), context.Background(), "org/r", w.Filters))
 	events := drainEvents(w.Events)
 	require.Len(t, events, 1)
 	assert.Equal(t, EventSnapshot, events[0].Kind)

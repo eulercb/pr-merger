@@ -143,8 +143,15 @@ func (m *Model) applyEvent(ev watcher.Event) {
 	switch ev.Kind {
 	case watcher.EventSnapshot:
 		st.PRs = ev.PRs
-		if ev.Head != nil {
+		switch {
+		case ev.Head != nil:
 			st.Head = ev.Head
+		case len(ev.PRs) == 0:
+			// Queue drained — don't keep rendering a stale head PR in
+			// the status bar after the last matching PR was merged or
+			// filtered out.
+			st.Head = nil
+			st.LastMsg = ""
 		}
 		if st.Cursor >= len(st.PRs) {
 			st.Cursor = 0

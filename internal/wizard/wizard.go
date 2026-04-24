@@ -63,20 +63,31 @@ type Result struct {
 	Path   string
 }
 
-// BuildConfig turns raw answers into a ready-to-save config. Returns a
-// descriptive error for each invalid field so the UI can surface them.
-func BuildConfig(a Answers) (*config.Config, error) {
-	repo := strings.TrimSpace(a.Repo)
+// ValidateRepo reports whether s is a well-formed "OWNER/NAME" slug. Used
+// by both the wizard's live per-step validation and the final BuildConfig
+// check so the two can't drift.
+func ValidateRepo(s string) error {
+	repo := strings.TrimSpace(s)
 	if repo == "" {
-		return nil, errors.New("repo is required")
+		return errors.New("repo is required")
 	}
-	if !strings.Contains(repo, "/") || strings.Count(repo, "/") != 1 {
-		return nil, fmt.Errorf("repo must be OWNER/NAME, got %q", repo)
+	if strings.Count(repo, "/") != 1 {
+		return fmt.Errorf("repo must be OWNER/NAME, got %q", repo)
 	}
 	parts := strings.Split(repo, "/")
 	if parts[0] == "" || parts[1] == "" {
-		return nil, fmt.Errorf("repo must be OWNER/NAME, got %q", repo)
+		return fmt.Errorf("repo must be OWNER/NAME, got %q", repo)
 	}
+	return nil
+}
+
+// BuildConfig turns raw answers into a ready-to-save config. Returns a
+// descriptive error for each invalid field so the UI can surface them.
+func BuildConfig(a Answers) (*config.Config, error) {
+	if err := ValidateRepo(a.Repo); err != nil {
+		return nil, err
+	}
+	repo := strings.TrimSpace(a.Repo)
 
 	name := strings.TrimSpace(a.FilterName)
 	if name == "" {

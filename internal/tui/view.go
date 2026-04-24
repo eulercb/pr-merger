@@ -72,15 +72,18 @@ func (m Model) renderPanel(repo string, st *RepoState, width int, active bool) s
 			lines = append(lines, mutedText.Render("  no eligible PRs"))
 		}
 	} else {
-		// Reserve inner width for the title column.
+		// Reserve inner width for the title column. Size the PR number
+		// column to the widest number currently in the queue so five- and
+		// six-digit numbers (common in big monorepos) don't shift the
+		// title column and break alignment.
 		iconCol := 3
-		numCol := 6
+		numCol := prNumberColumnWidth(st.PRs)
 		innerTitleWidth := width - iconCol - numCol - 4
 		if innerTitleWidth < 10 {
 			innerTitleWidth = 10
 		}
 		for i, pr := range st.PRs {
-			lines = append(lines, renderPRLine(pr, innerTitleWidth, active && i == st.Cursor, i == 0))
+			lines = append(lines, renderPRLine(pr, numCol, innerTitleWidth, active && i == st.Cursor, i == 0))
 		}
 	}
 
@@ -92,7 +95,30 @@ func (m Model) renderPanel(repo string, st *RepoState, width int, active bool) s
 	return border.Width(width - 2).Render(body)
 }
 
-func renderPRLine(pr gh.PullRequest, titleWidth int, selected, isHead bool) string {
+// prNumberColumnWidth returns the width needed to left-align all PR numbers
+// in a queue, e.g. "#42   " / "#12345". Minimum 6 (`#9999 `) so the column
+// doesn't shrink below a comfortable default on small queues.
+func prNumberColumnWidth(prs []gh.PullRequest) int {
+	const minWidth = 6
+	max := 0
+	for _, pr := range prs {
+		if pr.Number > max {
+			max = pr.Number
+		}
+	}
+	digits := 1
+	for n := max; n >= 10; n /= 10 {
+		digits++
+	}
+	// Leading '#' + digits + trailing space for breathing room.
+	w := 1 + digits + 1
+	if w < minWidth {
+		return minWidth
+	}
+	return w
+}
+
+func renderPRLine(pr gh.PullRequest, numWidth, titleWidth int, selected, isHead bool) string {
 	state := gh.Classify(&pr)
 	icon := state.Icon()
 
@@ -110,7 +136,13 @@ func renderPRLine(pr gh.PullRequest, titleWidth int, selected, isHead bool) stri
 		iconStyle = mutedText
 	}
 
-	number := fmt.Sprintf("#%-4d", pr.Number)
+	// numWidth already accounts for '#' + digits + trailing space; the
+	// format string pads the numeric portion only.
+	numericWidth := numWidth - 2
+	if numericWidth < 1 {
+		numericWidth = 1
+	}
+	number := fmt.Sprintf("#%-*d", numericWidth, pr.Number)
 	title := titleFor(pr, titleWidth)
 
 	prefix := " "

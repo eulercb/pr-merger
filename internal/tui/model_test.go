@@ -93,6 +93,22 @@ func TestApplyEvent_CursorResetsWhenBeyondQueue(t *testing.T) {
 	assert.Equal(t, 0, m.states["org/a"].Cursor)
 }
 
+// TestApplyEvent_EmptySnapshotClearsStaleHead guards the Copilot-flagged
+// regression: after a queue drains, the status bar must stop showing the
+// PR we were acting on last tick.
+func TestApplyEvent_EmptySnapshotClearsStaleHead(t *testing.T) {
+	t.Parallel()
+	m := newTestModel()
+	prev := &gh.PullRequest{Number: 42, Title: "old head"}
+	m.states["org/a"].Head = prev
+	m.states["org/a"].LastMsg = "rebased #42"
+
+	m.applyEvent(watcher.Event{Repo: "org/a", Kind: watcher.EventSnapshot, PRs: nil})
+
+	assert.Nil(t, m.states["org/a"].Head, "Head must be cleared when queue drains")
+	assert.Empty(t, m.states["org/a"].LastMsg, "stale rebase message should be cleared too")
+}
+
 func TestUpdate_QuitKey(t *testing.T) {
 	t.Parallel()
 	m := newTestModel()

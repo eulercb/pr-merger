@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -79,11 +81,16 @@ func runDashboard(parent context.Context) error {
 		interval = 30 * time.Second
 	}
 
-	// Silence watcher logs to a file; we don't want them corrupting the TUI.
-	logger := log.New(os.Stderr, "", 0)
-	if f, err := os.OpenFile(filepath(cfg, path), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
-		logger = log.New(f, "", log.LstdFlags)
+	// Watcher logs must never hit stdout/stderr while the TUI owns the
+	// alt-screen — the escape sequences would corrupt the render. Try to
+	// write to a log file next to the config; on failure, silently discard
+	// rather than poison the UI.
+	logOut := io.Writer(io.Discard)
+	if f, err := os.OpenFile(logPathForConfig(path), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+		defer f.Close()
+		logOut = f
 	}
+	logger := log.New(logOut, "", log.LstdFlags)
 
 	w := watcher.New(client, cfg.Filters, interval, logger)
 
@@ -103,19 +110,23 @@ func runDashboard(parent context.Context) error {
 		watcherDone <- w.Run(ctx)
 	}()
 
-	_, err = program.Run()
+	_, uiErr := program.Run()
 	stop() // cancel the watcher
-	<-watcherDone
-	return err
+	watcherErr := <-watcherDone
+	if watcherErr != nil {
+		watcherErr = fmt.Errorf("watcher: %w", watcherErr)
+	}
+	return errors.Join(uiErr, watcherErr)
 }
 
-// filepath returns the log file path alongside the user's config file.
-// Inlined instead of pulling in path/filepath for a single Join.
-func filepath(_ *config.Config, cfgPath string) string {
-	if i := strings.LastIndex(cfgPath, "/"); i >= 0 {
-		return cfgPath[:i+1] + "pr-merger.log"
+// logPathForConfig returns the log file path alongside the user's config
+// file, e.g. ~/.config/pr-merger/config.yaml → ~/.config/pr-merger/pr-merger.log.
+func logPathForConfig(cfgPath string) string {
+	dir := filepath.Dir(cfgPath)
+	if dir == "" || dir == "." {
+		return "pr-merger.log"
 	}
-	return "pr-merger.log"
+	return filepath.Join(dir, "pr-merger.log")
 }
 
 // runWizard launches the interactive wizard and returns the resulting config,

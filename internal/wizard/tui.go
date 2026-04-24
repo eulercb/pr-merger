@@ -20,7 +20,6 @@ const (
 	stepAuthor
 	stepInterval
 	stepConfirm
-	stepDone
 )
 
 // Model is the Bubble Tea model for the wizard.
@@ -99,8 +98,10 @@ func (m Model) advance() (tea.Model, tea.Cmd) {
 	switch m.step {
 	case stepRepo:
 		repo := strings.TrimSpace(m.inputs[stepRepo].Value())
-		if repo == "" {
-			m.err = "repo is required"
+		// Validate OWNER/NAME here — otherwise the user fills in two more
+		// screens before hitting the same check at BuildConfig time.
+		if err := ValidateRepo(repo); err != nil {
+			m.err = err.Error()
 			return m, nil
 		}
 		// Advance to filter-name; pre-fill with suggested default.
@@ -131,7 +132,8 @@ func (m Model) advance() (tea.Model, tea.Cmd) {
 		m.Cfg = cfg
 		m.step = stepConfirm
 	case stepConfirm:
-		m.step = stepDone
+		// Config is already built in stepInterval; quit so the caller
+		// can read m.Cfg and persist it.
 		return m, tea.Quit
 	}
 	return m, nil
@@ -179,8 +181,6 @@ func (m Model) View() string {
 	case stepConfirm:
 		body = "Review:\n\n" + renderConfig(m.Cfg) + "\n\n" +
 			hint.Render("Press Enter to save, Esc to abort.")
-	case stepDone:
-		body = "Saved. Press any key."
 	}
 
 	out := title + "\n\n" + body

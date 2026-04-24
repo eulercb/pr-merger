@@ -143,6 +143,20 @@ func TestPrepareHeadless_DiscoveryErrorStillBuildsIfRepoProvided(t *testing.T) {
 	require.Error(t, result.Discovery.Err)
 }
 
+func TestValidateRepo(t *testing.T) {
+	t.Parallel()
+
+	ok := []string{"toggl/ic-tribe", "o/r", "with-dash/repo.name"}
+	for _, s := range ok {
+		assert.NoError(t, ValidateRepo(s), "expected %q to validate", s)
+	}
+
+	bad := []string{"", "noslash", "a/b/c", "/b", "a/", "  "}
+	for _, s := range bad {
+		assert.Error(t, ValidateRepo(s), "expected %q to fail validation", s)
+	}
+}
+
 func TestDefaultFilterName(t *testing.T) {
 	t.Parallel()
 	assert.Equal(t, "ic-tribe-automerge", defaultFilterName("toggl/ic-tribe"))

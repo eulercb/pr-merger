@@ -36,8 +36,10 @@ const (
 )
 
 // Event is a per-repo notification emitted on every watcher action or
-// observation. Events flow through an unbuffered channel so consumers (TUI,
-// log writer) see them live.
+// observation. Events flow through a buffered channel so a slow consumer
+// can fall behind by a few ticks without blocking the per-repo goroutine.
+// Consumers must still eventually drain the channel; when the buffer is
+// full and the run context is cancelled the event is dropped and logged.
 type Event struct {
 	Repo    string
 	Kind    EventKind
@@ -69,6 +71,11 @@ type Watcher struct {
 	now func() time.Time
 }
 
+// defaultEventBuffer is how many events one repo can queue up before the
+// channel blocks. Large enough that a few slow UI renders don't cause
+// drops; small enough that genuine consumer starvation is visible.
+const defaultEventBuffer = 64
+
 // New builds a watcher. Callers can read w.Events for live updates.
 func New(client gh.PRClient, filters []config.Filter, interval time.Duration, logger *log.Logger) *Watcher {
 	if logger == nil {
@@ -79,7 +86,7 @@ func New(client gh.PRClient, filters []config.Filter, interval time.Duration, lo
 		Filters:  filters,
 		Interval: interval,
 		Logger:   logger,
-		Events:   make(chan Event),
+		Events:   make(chan Event, defaultEventBuffer),
 		now:      time.Now,
 	}
 }
@@ -132,23 +139,27 @@ func (w *Watcher) runRepo(ctx context.Context, repo string, filters []config.Fil
 	}
 }
 
-// tickRepo runs a single bounded iteration for one repo. Per-repo timeout
-// equals the poll interval so a hung gh invocation can't stall the loop.
-func (w *Watcher) tickRepo(ctx context.Context, repo string, filters []config.Filter) {
-	callCtx, cancel := context.WithTimeout(ctx, w.Interval)
+// tickRepo runs a single bounded iteration for one repo. The gh calls get a
+// per-tick timeout (so a hung invocation can't stall the loop); event emits
+// get the run-level context so a slow tick doesn't cause snapshots to be
+// silently dropped just because the tick expired.
+func (w *Watcher) tickRepo(runCtx context.Context, repo string, filters []config.Filter) {
+	callCtx, cancel := context.WithTimeout(runCtx, w.Interval)
 	defer cancel()
-	if err := w.processRepo(callCtx, repo, filters); err != nil {
+	if err := w.processRepo(runCtx, callCtx, repo, filters); err != nil {
 		w.Logger.Printf("[%s] iteration error: %v", repo, err)
-		w.emit(ctx, Event{Repo: repo, Kind: EventError, At: w.now(), Message: err.Error()})
+		w.emit(runCtx, Event{Repo: repo, Kind: EventError, At: w.now(), Message: err.Error()})
 	}
 }
 
-// emit sends on Events with respect to ctx cancellation, so shutdown never
-// deadlocks even if the consumer stopped reading.
+// emit sends on Events. It only gives up when the run-level context is
+// cancelled (shutdown). Dropped events are logged so the operator can see
+// backpressure instead of silent loss.
 func (w *Watcher) emit(ctx context.Context, ev Event) {
 	select {
 	case w.Events <- ev:
 	case <-ctx.Done():
+		w.Logger.Printf("[%s] dropping event kind=%d: %v", ev.Repo, ev.Kind, ctx.Err())
 	}
 }
 
@@ -163,8 +174,11 @@ func groupFiltersByRepo(filters []config.Filter) map[string][]config.Filter {
 // processRepo picks at most one PR per repo per tick: the oldest queued PR
 // that matches any filter, has auto-merge on, and is either BEHIND (rebase it)
 // or BLOCKED/UNSTABLE with running checks (just report status).
-func (w *Watcher) processRepo(ctx context.Context, repo string, filters []config.Filter) error {
-	prs, err := w.Client.ListOpenPRs(ctx, repo)
+//
+// emitCtx is the run-level context used for publishing events; callCtx has
+// the per-tick timeout and scopes every gh invocation.
+func (w *Watcher) processRepo(emitCtx, callCtx context.Context, repo string, filters []config.Filter) error {
+	prs, err := w.Client.ListOpenPRs(callCtx, repo)
 	if err != nil {
 		return err
 	}
@@ -176,14 +190,14 @@ func (w *Watcher) processRepo(ctx context.Context, repo string, filters []config
 
 	if len(queue) == 0 {
 		w.Logger.Printf("[%s] no auto-merge PRs match filters", repo)
-		w.emit(ctx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: nil})
+		w.emit(emitCtx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: nil})
 		return nil
 	}
 
 	head := queue[0]
 
 	// Refetch head with status-check rollup for accurate state.
-	full, err := w.Client.GetPR(ctx, repo, head.Number)
+	full, err := w.Client.GetPR(callCtx, repo, head.Number)
 	if err != nil {
 		return fmt.Errorf("view PR #%d: %w", head.Number, err)
 	}
@@ -192,24 +206,24 @@ func (w *Watcher) processRepo(ctx context.Context, repo string, filters []config
 	// marked the PR as draft, or changed labels between list and view.
 	if full.AutoMergeRequest == nil {
 		w.Logger.Printf("[%s] PR #%d no longer has auto-merge enabled; skipping", repo, full.Number)
-		w.emit(ctx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: dropByNumber(queue, full.Number)})
+		w.emit(emitCtx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: dropByNumber(queue, full.Number)})
 		return nil
 	}
 	if full.IsDraft {
 		w.Logger.Printf("[%s] PR #%d is now a draft; skipping", repo, full.Number)
-		w.emit(ctx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: dropByNumber(queue, full.Number)})
+		w.emit(emitCtx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: dropByNumber(queue, full.Number)})
 		return nil
 	}
 	if !prutil.MatchesAny(*full, filters) {
 		w.Logger.Printf("[%s] PR #%d no longer matches any filter; skipping", repo, full.Number)
-		w.emit(ctx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: dropByNumber(queue, full.Number)})
+		w.emit(emitCtx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: dropByNumber(queue, full.Number)})
 		return nil
 	}
 
 	// Splice the refetched head back into the snapshot so TUI callers see
 	// the most accurate state for the PR we're acting on.
 	queue[0] = *full
-	w.emit(ctx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: queue, Head: full})
+	w.emit(emitCtx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: queue, Head: full})
 
 	w.Logger.Printf("[%s] head PR #%d %q (state=%s, mergeable=%s)",
 		repo, full.Number, prutil.Truncate(full.Title, 60), full.MergeStateStatus, full.Mergeable)
@@ -218,34 +232,34 @@ func (w *Watcher) processRepo(ctx context.Context, repo string, filters []config
 	case "BEHIND":
 		if full.Mergeable == "CONFLICTING" {
 			w.Logger.Printf("[%s] PR #%d has conflicts; skipping rebase", repo, full.Number)
-			w.emit(ctx, Event{Repo: repo, Kind: EventConflict, At: w.now(), Head: full,
+			w.emit(emitCtx, Event{Repo: repo, Kind: EventConflict, At: w.now(), Head: full,
 				Message: "conflicts; cannot rebase"})
 			return nil
 		}
 		w.Logger.Printf("[%s] rebasing PR #%d", repo, full.Number)
-		if err := w.Client.UpdateBranchRebase(ctx, full.ID); err != nil {
+		if err := w.Client.UpdateBranchRebase(callCtx, full.ID); err != nil {
 			return fmt.Errorf("rebase PR #%d: %w", full.Number, err)
 		}
-		w.emit(ctx, Event{Repo: repo, Kind: EventRebased, At: w.now(), Head: full,
+		w.emit(emitCtx, Event{Repo: repo, Kind: EventRebased, At: w.now(), Head: full,
 			Message: fmt.Sprintf("rebased #%d", full.Number)})
 	case "BLOCKED", "UNSTABLE", "UNKNOWN":
 		summarizeChecks(w.Logger, repo, full)
-		w.emit(ctx, Event{Repo: repo, Kind: EventWaiting, At: w.now(), Head: full,
+		w.emit(emitCtx, Event{Repo: repo, Kind: EventWaiting, At: w.now(), Head: full,
 			Message: "waiting on checks/reviews"})
 	case "CLEAN", "HAS_HOOKS":
 		w.Logger.Printf("[%s] PR #%d clean, waiting for GitHub auto-merge", repo, full.Number)
-		w.emit(ctx, Event{Repo: repo, Kind: EventWaiting, At: w.now(), Head: full,
+		w.emit(emitCtx, Event{Repo: repo, Kind: EventWaiting, At: w.now(), Head: full,
 			Message: "clean; waiting for GitHub auto-merge"})
 	case "DIRTY":
 		w.Logger.Printf("[%s] PR #%d has merge conflicts; human action required", repo, full.Number)
-		w.emit(ctx, Event{Repo: repo, Kind: EventConflict, At: w.now(), Head: full,
+		w.emit(emitCtx, Event{Repo: repo, Kind: EventConflict, At: w.now(), Head: full,
 			Message: "dirty; human action required"})
 	default:
 		// Unknown/new state from GitHub. Log and surface so the operator
 		// can tell what happened instead of silently no-oping.
 		w.Logger.Printf("[%s] PR #%d has unhandled merge state status %q (mergeable=%s); treating as unknown",
 			repo, full.Number, full.MergeStateStatus, full.Mergeable)
-		w.emit(ctx, Event{Repo: repo, Kind: EventWaiting, At: w.now(), Head: full,
+		w.emit(emitCtx, Event{Repo: repo, Kind: EventWaiting, At: w.now(), Head: full,
 			Message: "unhandled merge state " + full.MergeStateStatus})
 	}
 	return nil
