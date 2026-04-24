@@ -62,9 +62,13 @@ type Watcher struct {
 	Interval time.Duration
 	Logger   *log.Logger
 
-	// Events receives every observation/action. Unbuffered; consumers must
-	// drain it or the per-repo goroutine will block. The watcher closes it
-	// on shutdown.
+	// Events receives every observation/action. The channel is buffered
+	// (defaultEventBuffer) so consumers can fall behind by a few ticks
+	// without immediately blocking a per-repo goroutine; once the buffer
+	// fills up, sends apply backpressure and emit() will drop-and-log an
+	// event if the run-level context is cancelled while waiting. The
+	// watcher closes this channel on shutdown so consumers can range
+	// over it.
 	Events chan Event
 
 	// now is swappable in tests.

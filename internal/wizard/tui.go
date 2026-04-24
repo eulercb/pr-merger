@@ -76,6 +76,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			m.quit = true
+			// Clear any config that was populated at stepInterval so an
+			// abort on the confirm screen doesn't cause the caller to
+			// silently persist a config the user just declined.
+			m.Cfg = nil
 			return m, tea.Quit
 		case "enter":
 			return m.advance()

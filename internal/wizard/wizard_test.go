@@ -5,8 +5,11 @@ import (
 	"errors"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/eulercb/pr-merger/internal/config"
 )
 
 type fakeDisc struct {
@@ -141,6 +144,23 @@ func TestPrepareHeadless_DiscoveryErrorStillBuildsIfRepoProvided(t *testing.T) {
 	require.NotNil(t, result.Config)
 	assert.Equal(t, "o/r", result.Config.Filters[0].Repo)
 	require.Error(t, result.Discovery.Err)
+}
+
+// TestModel_AbortClearsCfg pins the Copilot-flagged contract: if the user
+// presses Esc after the wizard already populated Cfg at stepInterval, the
+// caller must not persist that config.
+func TestModel_AbortClearsCfg(t *testing.T) {
+	t.Parallel()
+	m := NewModel(Discovery{})
+	// Simulate a user who reached stepConfirm — Cfg is populated.
+	m.Cfg = &config.Config{PollInterval: 30}
+	m.step = stepConfirm
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	final, ok := updated.(Model)
+	require.True(t, ok)
+	assert.True(t, final.quit, "esc must set quit")
+	assert.Nil(t, final.Cfg, "Cfg must be cleared so caller doesn't persist a declined config")
 }
 
 func TestValidateRepo(t *testing.T) {
