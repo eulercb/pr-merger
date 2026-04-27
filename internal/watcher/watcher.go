@@ -28,8 +28,10 @@ const (
 	// EventWaiting signals the head PR is waiting on CI / reviews /
 	// auto-merge — no action taken.
 	EventWaiting
-	// EventConflict signals the head PR has merge conflicts and needs
-	// human attention.
+	// EventConflict signals a queued PR has merge conflicts and needs
+	// human attention. The watcher does not act on it and walks past it
+	// to the next eligible PR in the same tick, so a stuck head doesn't
+	// freeze the rest of the queue.
 	EventConflict
 	// EventError signals a poll or rebase failure. Message carries detail.
 	EventError
@@ -175,9 +177,11 @@ func groupFiltersByRepo(filters []config.Filter) map[string][]config.Filter {
 	return out
 }
 
-// processRepo picks at most one PR per repo per tick: the oldest queued PR
-// that matches any filter, has auto-merge on, and is either BEHIND (rebase it)
-// or BLOCKED/UNSTABLE with running checks (just report status).
+// processRepo picks at most one PR per repo per tick to act on: the oldest
+// queued PR that matches any filter, has auto-merge on, and isn't blocked on
+// merge conflicts. PRs with conflicts are walked past so a stuck head doesn't
+// freeze the queue; each one is reported via EventConflict so the operator
+// still sees it.
 //
 // emitCtx is the run-level context used for publishing events; callCtx has
 // the per-tick timeout and scopes every gh invocation.
@@ -198,75 +202,102 @@ func (w *Watcher) processRepo(emitCtx, callCtx context.Context, repo string, fil
 		return nil
 	}
 
-	head := queue[0]
-
-	// Refetch head with status-check rollup for accurate state.
-	full, err := w.Client.GetPR(callCtx, repo, head.Number)
-	if err != nil {
-		return fmt.Errorf("view PR #%d: %w", head.Number, err)
+	// Walk oldest-first, refetching each candidate. Drop PRs that became
+	// ineligible between list and view; collect ones with conflicts to
+	// report later but keep scanning. Stop at the first actionable PR.
+	var (
+		head      *gh.PullRequest
+		conflicts []*gh.PullRequest
+	)
+	for i := 0; i < len(queue); {
+		candidate := queue[i]
+		full, err := w.Client.GetPR(callCtx, repo, candidate.Number)
+		if err != nil {
+			return fmt.Errorf("view PR #%d: %w", candidate.Number, err)
+		}
+		if full.AutoMergeRequest == nil {
+			w.Logger.Printf("[%s] PR #%d no longer has auto-merge enabled; skipping", repo, full.Number)
+			queue = append(queue[:i], queue[i+1:]...)
+			continue
+		}
+		if full.IsDraft {
+			w.Logger.Printf("[%s] PR #%d is now a draft; skipping", repo, full.Number)
+			queue = append(queue[:i], queue[i+1:]...)
+			continue
+		}
+		if !prutil.MatchesAny(*full, filters) {
+			w.Logger.Printf("[%s] PR #%d no longer matches any filter; skipping", repo, full.Number)
+			queue = append(queue[:i], queue[i+1:]...)
+			continue
+		}
+		// Splice the refetched PR back so the snapshot reflects fresh state.
+		queue[i] = *full
+		if isConflicted(full) {
+			w.Logger.Printf("[%s] PR #%d has conflicts; advancing to next eligible PR", repo, full.Number)
+			conflicts = append(conflicts, full)
+			i++
+			continue
+		}
+		head = full
+		break
 	}
 
-	// Re-validate eligibility: the user may have disabled auto-merge,
-	// marked the PR as draft, or changed labels between list and view.
-	if full.AutoMergeRequest == nil {
-		w.Logger.Printf("[%s] PR #%d no longer has auto-merge enabled; skipping", repo, full.Number)
-		w.emit(emitCtx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: dropByNumber(queue, full.Number)})
-		return nil
-	}
-	if full.IsDraft {
-		w.Logger.Printf("[%s] PR #%d is now a draft; skipping", repo, full.Number)
-		w.emit(emitCtx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: dropByNumber(queue, full.Number)})
-		return nil
-	}
-	if !prutil.MatchesAny(*full, filters) {
-		w.Logger.Printf("[%s] PR #%d no longer matches any filter; skipping", repo, full.Number)
-		w.emit(emitCtx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: dropByNumber(queue, full.Number)})
-		return nil
+	w.emit(emitCtx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: queue, Head: head})
+
+	for _, c := range conflicts {
+		w.emit(emitCtx, Event{Repo: repo, Kind: EventConflict, At: w.now(), Head: c,
+			Message: conflictMessage(c)})
 	}
 
-	// Splice the refetched head back into the snapshot so TUI callers see
-	// the most accurate state for the PR we're acting on.
-	queue[0] = *full
-	w.emit(emitCtx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: queue, Head: full})
+	if head == nil {
+		return nil
+	}
 
 	w.Logger.Printf("[%s] head PR #%d %q (state=%s, mergeable=%s)",
-		repo, full.Number, prutil.Truncate(full.Title, 60), full.MergeStateStatus, full.Mergeable)
+		repo, head.Number, prutil.Truncate(head.Title, 60), head.MergeStateStatus, head.Mergeable)
 
-	switch full.MergeStateStatus {
+	switch head.MergeStateStatus {
 	case "BEHIND":
-		if full.Mergeable == "CONFLICTING" {
-			w.Logger.Printf("[%s] PR #%d has conflicts; skipping rebase", repo, full.Number)
-			w.emit(emitCtx, Event{Repo: repo, Kind: EventConflict, At: w.now(), Head: full,
-				Message: "conflicts; cannot rebase"})
-			return nil
+		w.Logger.Printf("[%s] rebasing PR #%d", repo, head.Number)
+		if err := w.Client.UpdateBranchRebase(callCtx, head.ID); err != nil {
+			return fmt.Errorf("rebase PR #%d: %w", head.Number, err)
 		}
-		w.Logger.Printf("[%s] rebasing PR #%d", repo, full.Number)
-		if err := w.Client.UpdateBranchRebase(callCtx, full.ID); err != nil {
-			return fmt.Errorf("rebase PR #%d: %w", full.Number, err)
-		}
-		w.emit(emitCtx, Event{Repo: repo, Kind: EventRebased, At: w.now(), Head: full,
-			Message: fmt.Sprintf("rebased #%d", full.Number)})
+		w.emit(emitCtx, Event{Repo: repo, Kind: EventRebased, At: w.now(), Head: head,
+			Message: fmt.Sprintf("rebased #%d", head.Number)})
 	case "BLOCKED", "UNSTABLE", "UNKNOWN":
-		summarizeChecks(w.Logger, repo, full)
-		w.emit(emitCtx, Event{Repo: repo, Kind: EventWaiting, At: w.now(), Head: full,
+		summarizeChecks(w.Logger, repo, head)
+		w.emit(emitCtx, Event{Repo: repo, Kind: EventWaiting, At: w.now(), Head: head,
 			Message: "waiting on checks/reviews"})
 	case "CLEAN", "HAS_HOOKS":
-		w.Logger.Printf("[%s] PR #%d clean, waiting for GitHub auto-merge", repo, full.Number)
-		w.emit(emitCtx, Event{Repo: repo, Kind: EventWaiting, At: w.now(), Head: full,
+		w.Logger.Printf("[%s] PR #%d clean, waiting for GitHub auto-merge", repo, head.Number)
+		w.emit(emitCtx, Event{Repo: repo, Kind: EventWaiting, At: w.now(), Head: head,
 			Message: "clean; waiting for GitHub auto-merge"})
-	case "DIRTY":
-		w.Logger.Printf("[%s] PR #%d has merge conflicts; human action required", repo, full.Number)
-		w.emit(emitCtx, Event{Repo: repo, Kind: EventConflict, At: w.now(), Head: full,
-			Message: "dirty; human action required"})
 	default:
 		// Unknown/new state from GitHub. Log and surface so the operator
 		// can tell what happened instead of silently no-oping.
 		w.Logger.Printf("[%s] PR #%d has unhandled merge state status %q (mergeable=%s); treating as unknown",
-			repo, full.Number, full.MergeStateStatus, full.Mergeable)
-		w.emit(emitCtx, Event{Repo: repo, Kind: EventWaiting, At: w.now(), Head: full,
-			Message: "unhandled merge state " + full.MergeStateStatus})
+			repo, head.Number, head.MergeStateStatus, head.Mergeable)
+		w.emit(emitCtx, Event{Repo: repo, Kind: EventWaiting, At: w.now(), Head: head,
+			Message: "unhandled merge state " + head.MergeStateStatus})
 	}
 	return nil
+}
+
+// isConflicted reports whether the PR has merge conflicts that prevent
+// either a rebase or a clean merge. DIRTY is GitHub's explicit conflict
+// state; BEHIND + CONFLICTING means a rebase would conflict.
+func isConflicted(pr *gh.PullRequest) bool {
+	if pr.MergeStateStatus == "DIRTY" {
+		return true
+	}
+	return pr.MergeStateStatus == "BEHIND" && pr.Mergeable == "CONFLICTING"
+}
+
+func conflictMessage(pr *gh.PullRequest) string {
+	if pr.MergeStateStatus == "DIRTY" {
+		return "dirty; human action required"
+	}
+	return "conflicts; cannot rebase"
 }
 
 // filterQueue returns PRs that have auto-merge enabled and match at least one
@@ -281,20 +312,6 @@ func filterQueue(prs []gh.PullRequest, filters []config.Filter) []gh.PullRequest
 			continue
 		}
 		if !prutil.MatchesAny(pr, filters) {
-			continue
-		}
-		out = append(out, pr)
-	}
-	return out
-}
-
-// dropByNumber returns q with the PR matching number removed. Used when the
-// head PR became ineligible between list and view so the snapshot reflects
-// what the watcher actually considers queued.
-func dropByNumber(q []gh.PullRequest, number int) []gh.PullRequest {
-	out := make([]gh.PullRequest, 0, len(q))
-	for _, pr := range q {
-		if pr.Number == number {
 			continue
 		}
 		out = append(out, pr)
