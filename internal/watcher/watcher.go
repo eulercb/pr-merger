@@ -203,12 +203,11 @@ func (w *Watcher) processRepo(emitCtx, callCtx context.Context, repo string, fil
 	}
 
 	// Walk oldest-first, refetching each candidate. Drop PRs that became
-	// ineligible between list and view; collect ones with conflicts to
-	// report later but keep scanning. Stop at the first actionable PR.
-	var (
-		head      *gh.PullRequest
-		conflicts []*gh.PullRequest
-	)
+	// ineligible between list and view; emit a conflict event for each
+	// conflicted PR and keep scanning. Stop at the first actionable PR.
+	// Conflicts are emitted before the terminal snapshot so the snapshot
+	// remains the source of truth for the repo's head.
+	var head *gh.PullRequest
 	for i := 0; i < len(queue); {
 		candidate := queue[i]
 		full, err := w.Client.GetPR(callCtx, repo, candidate.Number)
@@ -234,7 +233,8 @@ func (w *Watcher) processRepo(emitCtx, callCtx context.Context, repo string, fil
 		queue[i] = *full
 		if isConflicted(full) {
 			w.Logger.Printf("[%s] PR #%d has conflicts; advancing to next eligible PR", repo, full.Number)
-			conflicts = append(conflicts, full)
+			w.emit(emitCtx, Event{Repo: repo, Kind: EventConflict, At: w.now(), Head: full,
+				Message: conflictMessage(full)})
 			i++
 			continue
 		}
@@ -243,11 +243,6 @@ func (w *Watcher) processRepo(emitCtx, callCtx context.Context, repo string, fil
 	}
 
 	w.emit(emitCtx, Event{Repo: repo, Kind: EventSnapshot, At: w.now(), PRs: queue, Head: head})
-
-	for _, c := range conflicts {
-		w.emit(emitCtx, Event{Repo: repo, Kind: EventConflict, At: w.now(), Head: c,
-			Message: conflictMessage(c)})
-	}
 
 	if head == nil {
 		return nil

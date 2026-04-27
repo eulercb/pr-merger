@@ -222,17 +222,30 @@ func TestProcessRepo_SkipsConflictedHeadAndRebasesNext(t *testing.T) {
 	assert.NotContains(t, fc.getCalls, prKey("org/r", 3))
 
 	events := drainEvents(w.Events)
-	ks := kinds(events)
-	assert.Contains(t, ks, EventConflict)
-	assert.Contains(t, ks, EventRebased)
 
-	// Snapshot's Head must be the actionable PR, not the conflicted one.
-	for _, ev := range events {
-		if ev.Kind == EventSnapshot {
-			require.NotNil(t, ev.Head)
-			assert.Equal(t, 2, ev.Head.Number)
+	// Pin the ordering: any conflict events must arrive before the
+	// snapshot so the snapshot's Head wins downstream, and the action
+	// event for the actionable head closes out the tick.
+	conflictIdx, snapshotIdx, rebasedIdx := -1, -1, -1
+	for i := range events {
+		switch events[i].Kind {
+		case EventConflict:
+			conflictIdx = i
+		case EventSnapshot:
+			snapshotIdx = i
+		case EventRebased:
+			rebasedIdx = i
 		}
 	}
+	require.NotEqual(t, -1, conflictIdx, "expected a conflict event for PR #1")
+	require.NotEqual(t, -1, snapshotIdx, "expected a snapshot event")
+	require.NotEqual(t, -1, rebasedIdx, "expected a rebase event for PR #2")
+	assert.Less(t, conflictIdx, snapshotIdx, "conflicts must precede the terminal snapshot")
+	assert.Less(t, snapshotIdx, rebasedIdx, "snapshot must precede the action event")
+
+	// Snapshot's Head must be the actionable PR, not the conflicted one.
+	require.NotNil(t, events[snapshotIdx].Head)
+	assert.Equal(t, 2, events[snapshotIdx].Head.Number)
 }
 
 func TestProcessRepo_SkipsDirtyHeadAndRebasesNext(t *testing.T) {
@@ -281,20 +294,34 @@ func TestProcessRepo_AllConflictedEmitsConflictsAndNoAction(t *testing.T) {
 	assert.Empty(t, fc.rebaseCalls)
 
 	events := drainEvents(w.Events)
-	var conflicts int
-	var snapshot *Event
+	require.NotEmpty(t, events)
+
+	conflictIndexes := make([]int, 0, 2)
+	snapshotIdx := -1
 	for i := range events {
 		switch events[i].Kind {
 		case EventConflict:
-			conflicts++
+			conflictIndexes = append(conflictIndexes, i)
 		case EventSnapshot:
-			snapshot = &events[i]
+			require.Equal(t, -1, snapshotIdx, "expected a single snapshot event")
+			snapshotIdx = i
 		}
 	}
-	assert.Equal(t, 2, conflicts, "one conflict event per skipped PR")
-	require.NotNil(t, snapshot)
+	assert.Len(t, conflictIndexes, 2, "one conflict event per skipped PR")
+	require.NotEqual(t, -1, snapshotIdx)
+
+	// All conflicts must arrive before the terminal snapshot, and the
+	// snapshot must be the last event in the tick — otherwise a trailing
+	// EventConflict would override the snapshot's Head=nil downstream.
+	for _, idx := range conflictIndexes {
+		assert.Less(t, idx, snapshotIdx, "conflict events must precede the terminal snapshot")
+	}
+	assert.Equal(t, snapshotIdx, len(events)-1, "snapshot must be the last event when no actionable PR exists")
+
+	snapshot := events[snapshotIdx]
 	assert.Nil(t, snapshot.Head, "no actionable head when every PR is conflicted")
 	assert.Len(t, snapshot.PRs, 2, "conflicted PRs stay visible in the queue")
+	assert.Nil(t, events[len(events)-1].Head, "last emitted event must leave Head=nil when no actionable PR exists")
 }
 
 func TestIsConflicted(t *testing.T) {

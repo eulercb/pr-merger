@@ -109,6 +109,29 @@ func TestApplyEvent_EmptySnapshotClearsStaleHead(t *testing.T) {
 	assert.Empty(t, m.states["org/a"].LastMsg, "stale rebase message should be cleared too")
 }
 
+// TestApplyEvent_SnapshotWithNoActionableHeadClearsHead covers the
+// all-conflicted case: the watcher emits a snapshot with Head=nil but a
+// non-empty queue. The TUI must adopt the nil head instead of clinging to
+// a stale value from the previous tick — otherwise the status bar would
+// keep advertising a head the watcher just told us isn't actionable.
+func TestApplyEvent_SnapshotWithNoActionableHeadClearsHead(t *testing.T) {
+	t.Parallel()
+	m := newTestModel()
+	stale := &gh.PullRequest{Number: 7, Title: "previous head"}
+	m.states["org/a"].Head = stale
+	m.states["org/a"].LastMsg = "rebased #7"
+
+	m.applyEvent(watcher.Event{
+		Repo: "org/a", Kind: watcher.EventSnapshot,
+		PRs: []gh.PullRequest{{Number: 1}, {Number: 2}}, // all conflicted, none actionable
+	})
+
+	assert.Nil(t, m.states["org/a"].Head, "snapshot with Head=nil must clear the stale head")
+	// LastMsg is intentionally preserved when PRs is non-empty so the most
+	// recent conflict message stays visible.
+	assert.Equal(t, "rebased #7", m.states["org/a"].LastMsg)
+}
+
 func TestUpdate_QuitKey(t *testing.T) {
 	t.Parallel()
 	m := newTestModel()
