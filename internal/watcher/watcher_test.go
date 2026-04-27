@@ -145,16 +145,6 @@ func TestFilterQueue_DropsDraftsAndNonAutoMerge(t *testing.T) {
 	assert.Equal(t, 1, got[0].Number)
 }
 
-func TestDropByNumber(t *testing.T) {
-	t.Parallel()
-	now := time.Now()
-	queue := []gh.PullRequest{autoMergePR(1, now), autoMergePR(2, now), autoMergePR(3, now)}
-	out := dropByNumber(queue, 2)
-	require.Len(t, out, 2)
-	assert.Equal(t, 1, out[0].Number)
-	assert.Equal(t, 3, out[1].Number)
-}
-
 func TestProcessRepo_RebasesBehindHead(t *testing.T) {
 	t.Parallel()
 	now := time.Now()
@@ -200,6 +190,158 @@ func TestProcessRepo_SkipsRebaseOnConflict(t *testing.T) {
 
 	events := drainEvents(w.Events)
 	assert.Contains(t, kinds(events), EventConflict)
+}
+
+func TestProcessRepo_SkipsConflictedHeadAndRebasesNext(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	// Oldest PR has conflicts; next-oldest is BEHIND and should be rebased.
+	pr1 := autoMergePR(1, now.Add(-3*time.Hour), func(p *gh.PullRequest) {
+		p.Mergeable = "CONFLICTING"
+	})
+	pr2 := autoMergePR(2, now.Add(-2*time.Hour))
+	pr3 := autoMergePR(3, now.Add(-1*time.Hour))
+
+	fc := &fakeClient{
+		listOpenPRsResults: map[string][]gh.PullRequest{"org/r": {pr3, pr1, pr2}},
+		getPRResults: map[string]*gh.PullRequest{
+			prKey("org/r", 1): &pr1,
+			prKey("org/r", 2): &pr2,
+		},
+	}
+	w := newTestWatcher(t, fc, []config.Filter{{Name: "f", Repo: "org/r"}})
+
+	require.NoError(t, w.processRepo(context.Background(), context.Background(), "org/r", w.Filters))
+
+	// PR#2 is the first non-conflicting eligible PR — it must be rebased.
+	require.Len(t, fc.rebaseCalls, 1)
+	assert.Equal(t, "node-2", fc.rebaseCalls[0])
+
+	// We should never have refetched PR#3 — once an actionable PR is found
+	// the walk stops, preserving "one action per repo per tick."
+	assert.NotContains(t, fc.getCalls, prKey("org/r", 3))
+
+	events := drainEvents(w.Events)
+
+	// Pin the ordering: any conflict events must arrive before the
+	// snapshot so the snapshot's Head wins downstream, and the action
+	// event for the actionable head closes out the tick.
+	conflictIdx, snapshotIdx, rebasedIdx := -1, -1, -1
+	for i := range events {
+		switch events[i].Kind {
+		case EventConflict:
+			conflictIdx = i
+		case EventSnapshot:
+			snapshotIdx = i
+		case EventRebased:
+			rebasedIdx = i
+		}
+	}
+	require.NotEqual(t, -1, conflictIdx, "expected a conflict event for PR #1")
+	require.NotEqual(t, -1, snapshotIdx, "expected a snapshot event")
+	require.NotEqual(t, -1, rebasedIdx, "expected a rebase event for PR #2")
+	assert.Less(t, conflictIdx, snapshotIdx, "conflicts must precede the terminal snapshot")
+	assert.Less(t, snapshotIdx, rebasedIdx, "snapshot must precede the action event")
+
+	// Snapshot's Head must be the actionable PR, not the conflicted one.
+	require.NotNil(t, events[snapshotIdx].Head)
+	assert.Equal(t, 2, events[snapshotIdx].Head.Number)
+}
+
+func TestProcessRepo_SkipsDirtyHeadAndRebasesNext(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	pr1 := autoMergePR(1, now.Add(-2*time.Hour), func(p *gh.PullRequest) {
+		p.MergeStateStatus = "DIRTY"
+	})
+	pr2 := autoMergePR(2, now.Add(-1*time.Hour))
+
+	fc := &fakeClient{
+		listOpenPRsResults: map[string][]gh.PullRequest{"org/r": {pr1, pr2}},
+		getPRResults: map[string]*gh.PullRequest{
+			prKey("org/r", 1): &pr1,
+			prKey("org/r", 2): &pr2,
+		},
+	}
+	w := newTestWatcher(t, fc, []config.Filter{{Name: "f", Repo: "org/r"}})
+
+	require.NoError(t, w.processRepo(context.Background(), context.Background(), "org/r", w.Filters))
+
+	require.Len(t, fc.rebaseCalls, 1)
+	assert.Equal(t, "node-2", fc.rebaseCalls[0])
+}
+
+func TestProcessRepo_AllConflictedEmitsConflictsAndNoAction(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	pr1 := autoMergePR(1, now.Add(-2*time.Hour), func(p *gh.PullRequest) {
+		p.Mergeable = "CONFLICTING"
+	})
+	pr2 := autoMergePR(2, now.Add(-1*time.Hour), func(p *gh.PullRequest) {
+		p.MergeStateStatus = "DIRTY"
+	})
+
+	fc := &fakeClient{
+		listOpenPRsResults: map[string][]gh.PullRequest{"org/r": {pr1, pr2}},
+		getPRResults: map[string]*gh.PullRequest{
+			prKey("org/r", 1): &pr1,
+			prKey("org/r", 2): &pr2,
+		},
+	}
+	w := newTestWatcher(t, fc, []config.Filter{{Name: "f", Repo: "org/r"}})
+
+	require.NoError(t, w.processRepo(context.Background(), context.Background(), "org/r", w.Filters))
+	assert.Empty(t, fc.rebaseCalls)
+
+	events := drainEvents(w.Events)
+	require.NotEmpty(t, events)
+
+	conflictIndexes := make([]int, 0, 2)
+	snapshotIdx := -1
+	for i := range events {
+		switch events[i].Kind {
+		case EventConflict:
+			conflictIndexes = append(conflictIndexes, i)
+		case EventSnapshot:
+			require.Equal(t, -1, snapshotIdx, "expected a single snapshot event")
+			snapshotIdx = i
+		}
+	}
+	assert.Len(t, conflictIndexes, 2, "one conflict event per skipped PR")
+	require.NotEqual(t, -1, snapshotIdx)
+
+	// All conflicts must arrive before the terminal snapshot, and the
+	// snapshot must be the last event in the tick — otherwise a trailing
+	// EventConflict would override the snapshot's Head=nil downstream.
+	for _, idx := range conflictIndexes {
+		assert.Less(t, idx, snapshotIdx, "conflict events must precede the terminal snapshot")
+	}
+	assert.Equal(t, snapshotIdx, len(events)-1, "snapshot must be the last event when no actionable PR exists")
+
+	snapshot := events[snapshotIdx]
+	assert.Nil(t, snapshot.Head, "no actionable head when every PR is conflicted")
+	assert.Len(t, snapshot.PRs, 2, "conflicted PRs stay visible in the queue")
+	assert.Nil(t, events[len(events)-1].Head, "last emitted event must leave Head=nil when no actionable PR exists")
+}
+
+func TestIsConflicted(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		pr   gh.PullRequest
+		want bool
+	}{
+		{"dirty", gh.PullRequest{MergeStateStatus: "DIRTY"}, true},
+		{"behind+conflicting", gh.PullRequest{MergeStateStatus: "BEHIND", Mergeable: "CONFLICTING"}, true},
+		{"behind+mergeable", gh.PullRequest{MergeStateStatus: "BEHIND", Mergeable: "MERGEABLE"}, false},
+		{"clean", gh.PullRequest{MergeStateStatus: "CLEAN", Mergeable: "MERGEABLE"}, false},
+		{"clean+conflicting-not-behind", gh.PullRequest{MergeStateStatus: "CLEAN", Mergeable: "CONFLICTING"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isConflicted(&tc.pr))
+		})
+	}
 }
 
 func TestProcessRepo_SkipsWhenAutoMergeDisabledBetweenListAndView(t *testing.T) {

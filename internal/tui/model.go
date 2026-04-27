@@ -143,14 +143,15 @@ func (m *Model) applyEvent(ev watcher.Event) {
 	switch ev.Kind {
 	case watcher.EventSnapshot:
 		st.PRs = ev.PRs
-		switch {
-		case ev.Head != nil:
-			st.Head = ev.Head
-		case len(ev.PRs) == 0:
-			// Queue drained — don't keep rendering a stale head PR in
-			// the status bar after the last matching PR was merged or
-			// filtered out.
-			st.Head = nil
+		// The snapshot is authoritative for the repo's head. Always adopt
+		// ev.Head — including nil, which the watcher emits when every
+		// queued PR is conflicted and there's no actionable head this
+		// tick. Conditionally updating would leave a stale head from the
+		// previous tick visible.
+		st.Head = ev.Head
+		if len(ev.PRs) == 0 {
+			// Queue drained — clear the status line too so the bar
+			// doesn't keep showing "rebased #42" after the PR merged.
 			st.LastMsg = ""
 		}
 		if st.Cursor >= len(st.PRs) {
