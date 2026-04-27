@@ -51,7 +51,10 @@ type Event struct {
 	// Populated on EventSnapshot.
 	PRs []gh.PullRequest
 	// Head is the PR we acted on or inspected, with statusCheckRollup
-	// included. nil when the queue is empty.
+	// included. On EventSnapshot, nil means "no actionable head this
+	// tick" — either the queue is empty or every queued PR is
+	// conflicted; consumers must clear any cached head when they see
+	// nil here, regardless of len(PRs).
 	Head *gh.PullRequest
 }
 
