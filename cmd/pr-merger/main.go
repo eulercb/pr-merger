@@ -2,22 +2,28 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 
 	"github.com/eulercb/pr-merger/internal/config"
 	"github.com/eulercb/pr-merger/internal/gh"
 	"github.com/eulercb/pr-merger/internal/prutil"
+	"github.com/eulercb/pr-merger/internal/tui"
 	"github.com/eulercb/pr-merger/internal/watcher"
+	"github.com/eulercb/pr-merger/internal/wizard"
 )
 
 func main() {
@@ -32,27 +38,156 @@ func newRootCmd() *cobra.Command {
 		Use:   "pr-merger",
 		Short: "Watch GitHub PRs with auto-merge enabled and rebase them one at a time",
 		Long: "pr-merger monitors PRs that have auto-merge enabled in the repos/filters you configure, " +
-			"rebases one PR at a time per repo, and lets GitHub auto-merge take over once required checks pass.",
+			"rebases one PR at a time per repo, and lets GitHub auto-merge take over once required checks pass. " +
+			"With no subcommand, it launches an interactive dashboard.",
 		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runDashboard(cmd.Context())
+		},
 	}
-	root.AddCommand(newWatchCmd(), newFilterCmd(), newStatusCmd(), newConfigCmd())
+	root.AddCommand(newWatchCmd(), newFilterCmd(), newStatusCmd(), newConfigCmd(), newSetupCmd())
 	return root
 }
 
-// ---- watch ----
+// ---- dashboard (default) ----
+
+func runDashboard(parent context.Context) error {
+	cfg, path, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+	if len(cfg.Filters) == 0 {
+		fmt.Fprintln(os.Stderr, "No filters configured. Launching setup wizard...")
+		built, err := runWizard(parent)
+		if err != nil {
+			return err
+		}
+		if built == nil {
+			return nil // user aborted
+		}
+		if _, err := config.Save(built); err != nil {
+			return fmt.Errorf("save config: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "Saved config to %s\n", path)
+		cfg = built
+	}
+
+	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	client := gh.New()
+	interval := time.Duration(cfg.PollInterval) * time.Second
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+
+	// Watcher logs must never hit stdout/stderr while the TUI owns the
+	// alt-screen — the escape sequences would corrupt the render. Try to
+	// write to a log file next to the config; on failure, silently discard
+	// rather than poison the UI.
+	logOut := io.Writer(io.Discard)
+	if f, err := os.OpenFile(logPathForConfig(path), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+		defer f.Close()
+		logOut = f
+	}
+	logger := log.New(logOut, "", log.LstdFlags)
+
+	w := watcher.New(client, cfg.Filters, interval, logger)
+
+	model := tui.NewModel(cfg)
+	program := tea.NewProgram(model, tea.WithContext(ctx), tea.WithAltScreen())
+
+	// Pump watcher events into the bubbletea program.
+	go func() {
+		for ev := range w.Events {
+			program.Send(tui.WatcherEventMsg(ev))
+		}
+	}()
+
+	// Run the watcher in the background; stop it when the TUI exits.
+	watcherDone := make(chan error, 1)
+	go func() {
+		watcherDone <- w.Run(ctx)
+	}()
+
+	_, uiErr := program.Run()
+	stop() // cancel the watcher
+	watcherErr := <-watcherDone
+	if watcherErr != nil {
+		watcherErr = fmt.Errorf("watcher: %w", watcherErr)
+	}
+	return errors.Join(uiErr, watcherErr)
+}
+
+// logPathForConfig returns the log file path alongside the user's config
+// file, e.g. ~/.config/pr-merger/config.yaml → ~/.config/pr-merger/pr-merger.log.
+func logPathForConfig(cfgPath string) string {
+	dir := filepath.Dir(cfgPath)
+	if dir == "" || dir == "." {
+		return "pr-merger.log"
+	}
+	return filepath.Join(dir, "pr-merger.log")
+}
+
+// runWizard launches the interactive wizard and returns the resulting config,
+// or (nil, nil) if the user aborted.
+func runWizard(ctx context.Context) (*config.Config, error) {
+	discCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	disc := wizard.Discover(discCtx, gh.New())
+	cancel()
+
+	m := wizard.NewModel(disc)
+	prog := tea.NewProgram(m)
+	final, err := prog.Run()
+	if err != nil {
+		return nil, fmt.Errorf("wizard: %w", err)
+	}
+	fm, ok := final.(wizard.Model)
+	if !ok {
+		return nil, errors.New("wizard: unexpected final model type")
+	}
+	return fm.Cfg, nil
+}
+
+// ---- setup ----
+
+func newSetupCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "setup",
+		Short: "Run the interactive setup wizard (overwrites any existing config)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			built, err := runWizard(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if built == nil {
+				fmt.Fprintln(os.Stderr, "wizard aborted")
+				return nil
+			}
+			path, err := config.Save(built)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("saved config to %s\n", path)
+			return nil
+		},
+	}
+}
+
+// ---- watch (headless) ----
 
 func newWatchCmd() *cobra.Command {
 	var interval time.Duration
 	cmd := &cobra.Command{
 		Use:   "watch",
-		Short: "Start the watch loop (runs until Ctrl-C)",
+		Short: "Run the watcher loop without a TUI (logs to stdout)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, path, err := config.Load()
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
 			if len(cfg.Filters) == 0 {
-				return fmt.Errorf("no filters configured in %s; use `pr-merger filter add ...`", path)
+				return fmt.Errorf("no filters configured in %s; run `pr-merger setup`", path)
 			}
 
 			pollInterval := interval
@@ -63,8 +198,14 @@ func newWatchCmd() *cobra.Command {
 			logger := log.New(os.Stdout, "", log.LstdFlags)
 			w := watcher.New(gh.New(), cfg.Filters, pollInterval, logger)
 
-			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
+
+			// Drain events (the watcher closes the channel on shutdown).
+			go func() {
+				for range w.Events {
+				}
+			}()
 			return w.Run(ctx)
 		},
 	}
@@ -101,7 +242,6 @@ func newStatusCmd() *cobra.Command {
 			}
 			sort.Strings(keys)
 
-			// Per-repo timeout so a slow repo can't starve later ones.
 			const perRepoTimeout = 30 * time.Second
 			for _, repo := range keys {
 				repoCtx, cancel := context.WithTimeout(cmd.Context(), perRepoTimeout)

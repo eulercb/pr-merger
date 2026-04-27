@@ -31,8 +31,31 @@ On each tick the watcher:
    - anything else → log as unhandled and treat as unknown.
 
 Processing is strictly one-per-repo per tick: rebasing PR #2 while PR #1 is
-still ahead in the queue would just put #2 out of date again. Across repos
-the work fans out in parallel goroutines, each bounded by the poll interval.
+still ahead in the queue would just put #2 out of date again. Each repo owns
+a long-running goroutine with its own ticker, so slow repos never block
+faster ones and a hung `gh` invocation is scoped to a single repo.
+
+## Interactive dashboard
+
+Running `pr-merger` with no subcommand launches a Bubble Tea TUI with one
+panel per configured repo. Each PR is rendered with a status icon:
+
+| Icon | Meaning                                      |
+|------|----------------------------------------------|
+| `✓`  | clean — waiting for GitHub to auto-merge     |
+| `↻`  | behind — `pr-merger` will rebase it          |
+| `●`  | checks running                               |
+| `▲`  | blocked on review / required statuses        |
+| `✗`  | checks failed                                |
+| `⚠`  | merge conflicts                              |
+| `◌`  | draft                                        |
+
+Keys: `tab` / `shift+tab` switch repo, `j` / `k` move the cursor, `?` toggles
+help, `q` quits.
+
+The first time you run `pr-merger` with no config, it launches a short setup
+wizard that picks a default repo from your recent GitHub contributions.
+You can re-run it any time with `pr-merger setup`.
 
 ## Install
 
@@ -48,7 +71,7 @@ go build -o ./pr-merger ./cmd/pr-merger
 
 ### Requirements
 
-- Go 1.24+ (to build).
+- Go 1.26+ (to build).
 - [`gh`](https://cli.github.com/) on `PATH`, authenticated to the repos you
   want to watch. `pr-merger` shells out to `gh` for every GitHub call.
 
@@ -133,18 +156,21 @@ A PR is eligible if it matches **at least one** filter.
 ## Layout
 
 ```
-cmd/pr-merger/        CLI (cobra) entry point
+cmd/pr-merger/        CLI (cobra) entry point; default command launches the TUI
 internal/config/      YAML-backed filter persistence
-internal/gh/          Wrapper around the gh CLI + PR/CheckRun types
+internal/gh/          Wrapper around the gh CLI + PR types + state classifier
 internal/prutil/      Shared helpers: filter matching + rune-aware truncate
-internal/watcher/     Poll loop: groups by repo, picks oldest, rebases
+internal/tui/         Bubble Tea dashboard: per-repo panels, status icons
+internal/watcher/     Per-repo goroutines; publishes events to subscribers
+internal/wizard/      First-run configuration wizard
 ```
 
 ## Limitations / non-goals
 
 - **Polling, not webhooks.** `pr-merger` runs locally and has no public
   endpoint, so it polls `gh` on an interval rather than subscribing to
-  GitHub events.
+  GitHub events. Each configured repo polls on its own goroutine with
+  its own ticker, so repos are fully independent.
 - **Up to 500 open PRs per repo** are considered per tick. The realistic
   target is a single user's auto-merge-enabled stack, which stays well
   under that; repos with more than 500 open PRs may miss some.
